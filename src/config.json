@@ -1,0 +1,8 @@
+{
+  "name": "modern_blue",
+  "background": {"r": 0, "g": 90, "b": 193},
+  "title_font": "Montserrat",
+  "body_font": "Lato",
+  "title_color": {"r": 255, "g": 255, "b": 255},
+  "body_color": {"r": 54, "g": 54, "b": 54}
+}
