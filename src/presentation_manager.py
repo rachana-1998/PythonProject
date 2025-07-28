@@ -1,4 +1,6 @@
 import os
+import json
+import aiohttp
 from pptx import Presentation
 from pptx.util import Inches, Pt
 from pptx.util import Inches
@@ -11,7 +13,34 @@ import logging
 from typing import Literal, Union, List, Dict, Any
 logger = logging.getLogger('mcp_presentation_manager')
 
+
+# initialize AI client
+async_anthropic = os.getenv("HF_API_Token")
+segmind_api_key = os.getenv("SM_API_Key")
+
 ChartTypes = Literal["bar", "line", "pie", "scatter", "area"]
+
+
+# Layout templates
+LAYOUTS = {
+    "title": {
+        "placeholders": ["title", "subtitle"],
+        "style": {"bg_color": "RGB(0, 90, 193)", "font": "Montserrat"}
+    },
+    "content": {
+        "placeholders": ["title", "bullet_points"],
+        "style": {"bg_gradient": ["RGB(0, 90, 193)", "RGB(224, 247, 250)"]}
+    },
+    "chart": {
+        "placeholders": ["title", "chart"],
+        "style": {"bg_color": "RGB(245, 245, 245)"}
+    },
+    "image": {
+        "placeholders": ["title", "image"],
+        "style": {"bg_color": "RGB(224, 224, 224)"}
+    }
+}
+
 # Theme definitions
 THEMES = {
     "modern_blue": {
@@ -27,6 +56,30 @@ THEMES = {
         "font": "Lato"
     }
 }
+# json structure
+ClaudeJson ={
+  "slides": [
+    {
+      "type": "title",
+      "title": "Project Overview",
+      "subtitle": "Q3 2025 Update",
+      "theme": "gradient_blue"
+    },
+    {
+      "type": "content",
+      "title": "Key Points",
+      "bullets": ["Point 1", "Point 2", "Point 3"],
+      "image_prompt": "Modern office setting",
+      "theme": "minimalist"
+    },
+    {
+      "type": "table",
+      "title": "Sales Data",
+      "data": [["Region", "Sales"], ["North", 1000], ["South", 1500]],
+      "theme": "professional"
+    }
+  ]
+}
 
 class PresentationManager:
     # Slide layout constants
@@ -41,26 +94,99 @@ class PresentationManager:
     SLIDE_LAYOUT_PICTURE_WITH_CAPTION = 8
 
 
+
+
     def __init__(self):
         self.presentations: Dict[str, Any] = {}
 
 
-    def apply_theme(self, presentation: Presentation, theme_name: str) -> dict:
+    def apply_theme(self, presentation: Presentation, theme) -> dict:
         """Apply a theme to the presentation's slide master."""
-        theme = THEMES.get(theme_name, THEMES["modern_blue"])
+        theme = THEMES.get(theme, THEMES["modern_blue"])
 
         slide_master = presentation.slide_master
         bg = slide_master.background
         fill = bg.fill
         fill.solid()
         fill.fore_color.rgb = RGBColor(*theme["background"])
-        logger.info(f"Applied theme {theme_name} to presentation")
+        logger.info(f"Applied theme {theme} to presentation")
         return theme
 
-    def create_presentation(self, presentation_name: str, theme: str = "modern_blue") -> Presentation:
+    prompt = """
+        Generate a JSON outline for a 5-slide PowerPoint presentation about sustainable architecture. Include:
+        - slide_title: string
+        - content: list of strings or objects (for tables/charts)
+        - layout: string (title, content, chart, image_text, table)
+        - styling: object with color_scheme (primary/secondary colors), font, and image_prompt (for Stable Diffusion)
+        Ensure the response is valid JSON.
+        """
+
+    def get_presentation_structure(prompt, model="claude-3.5-sonnet"):
+        """Query Claude for presentation structure in JSON format."""
+        client = async_anthropic
+        response = client.messages.create(
+            model=model,
+            max_tokens=1000,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        # Parse JSON from Claude's response
+        try:
+            return json.loads(response.content[0].text)
+        except json.JSONDecodeError:
+            raise ValueError("Claude did not return valid JSON")
+
+    async def generate_image(prompt):
+        """Generate image using Segmind API"""
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                    "https://api.segmind.com/v1/stable-diffusion",
+                    headers={"SM_API_Key": segmind_api_key},
+                    json={
+                        "prompt": prompt,
+                        "negative_prompt": "low quality, blurry",
+                        "samples": 1,
+                        "scheduler": "DPM++ 2M",
+                        "num_inference_steps": 25,
+                        "guidance_scale": 7.5,
+                        "seed": 1234,
+                        "img_width": 512,
+                        "img_height": 512
+                    }
+            ) as response:
+                if response.status == 200:
+                    with open("temp_image.jpg", "wb") as f:
+                        f.write(await response.read())
+                    return "temp_image.jpg"
+                return None
+    def create_presentation(self, presentation_name: str,json_input: str=None, theme: str = "modern_blue") -> Presentation:
         """Create a new presentation with the specified theme."""
         prs = Presentation()
         self.apply_theme(prs, theme)
+        # Parse JSON input if provided
+        if json_input:
+            try:
+                data = json.loads(json_input)
+                if not isinstance(data, dict) or "slides" not in data:
+                    raise ValueError("Invalid JSON format. Expected a 'slides' key.")
+
+                for slide_data in data["slides"]:
+                    slide_type = slide_data.get("type")
+                    slide_theme = slide_data.get("theme", theme)  # Use slide-specific theme or default
+                    if slide_type == "title":
+                        self.add_title_slide(prs, slide_data, slide_theme)
+                    elif slide_type == "content":
+                        self.add_content_slide(prs, slide_data, slide_theme)
+                    elif slide_type == "table":
+                        self.add_table_slide(prs, slide_data, slide_theme)
+                    else:
+                        logger.warning(f"Unsupported slide type '{slide_type}'")
+            except json.JSONDecodeError:
+                logger.error("Failed to parse JSON input")
+                raise ValueError("Invalid JSON input")
+            except Exception as e:
+                logger.error(f"Error processing JSON: {str(e)}")
+                raise
+
         self.presentations[presentation_name] = prs
         logger.info(f"Created presentation {presentation_name} with theme {theme}")
         return prs
