@@ -191,7 +191,7 @@ class PresentationManager:
         logger.info(f"Created presentation {presentation_name} with theme {theme}")
         return prs
 
-    def _add_formatted_bullets(self, text_frame, text_block, theme: dict):
+    def add_formatted_bullets(self, text_frame, text_block, theme: dict):
         """
         Process a text block and add paragraphs with proper bullet indentation
         using ASCII code detection:

@@ -1,27 +1,35 @@
 import os
 import json
-import io
+import sys
+import sys
+print("Attempting to import pptx", file=sys.stderr)
 import argparse
 import asyncio
+from datetime import datetime
+import logging
 from mcp.server.fastmcp import FastMCP
 from mcp.server import NotificationOptions
-
 from mcp.server.models import InitializationOptions
 import mcp.server.stdio
 import mcp.types as types
-import asyncio
-from pptx import Presentation
-import logging
+
 from presentation_manager import PresentationManager
 from chart_manager import ChartManager
 from vision_manager import VisionManager
+try:
+    from pptx import Presentation
+except ImportError:
+    logging.error("The 'python-pptx' library is required. Install it using 'pip install python-pptx'.")
+    sys.exit(1)
 
 logger = logging.getLogger('mcp_powerpoint_server')
 logger.info("Starting MCP Powerpoint Server")
 
 BACKUP_FILE_NAME = 'backup.pptx'
+logger = logging.getLogger('mcp_powerpoint_server')
 
-mcp =FastMCP("powerpoint-server")
+# Initialize FastMCP with logger
+mcp = FastMCP("powerpoint-server", logger=logger)
 
 # Configuration loading
 def load_config(config_path="config.json"):
@@ -37,7 +45,6 @@ def sanitize_path(base_path: str, file_name: str) -> str:
     Ensure that the resulting path doesn't escape outside the base directory
     Returns a safe, normalized path
     """
-
     joined_path = os.path.join(base_path, file_name)
     normalized_path = os.path.normpath(joined_path)
 
@@ -46,6 +53,11 @@ def sanitize_path(base_path: str, file_name: str) -> str:
 
     return normalized_path
 
+def validate_theme(theme: str, valid_themes: list | None = None) -> str:
+    """Validate the theme against a list of valid themes."""
+    if valid_themes is None:
+        valid_themes = ["modern_blue", "elegant_green"]
+    return theme if theme in valid_themes else "modern_blue"
 
 async def main():
     """Main function with CLI argument parsing."""
@@ -55,24 +67,20 @@ async def main():
                         help="Theme for presentations (e.g., modern_blue, elegant_green)")
     args = parser.parse_args()
 
-    folder_path = args.folder_path
+    global config
     config = load_config()
-   # theme = args.theme if args.theme in config.get("themes", ["modern_blue", "elegant_green"]) else config["theme"]
-    default_theme = args.theme if args.theme in config.get("themes", ["modern_blue", "elegant_green"]) else config[
-        "theme"]
+    default_theme = validate_theme(args.theme)
 
     presentation_manager = PresentationManager()
     chart_manager = ChartManager()
     vision_manager = VisionManager()
-    # server = Server("powerpoint-server")
     logger.debug("Registering Handlers")
-    path = folder_path
-
+    logger.info("Initializing PowerPoint MCP Server")
 
     @mcp.list_tools()
     async def handle_list_tools() -> list[types.Tool]:
         """List available PowerPoint tools."""
-
+        logger.debug("Listing available tools")
         return [
             types.Tool(
                 name="create-presentation",
@@ -167,7 +175,6 @@ async def main():
                             "description": "Theme for the slide (e.g., modern_blue, elegant_green)",
                             "default": default_theme
                         }
-
                     },
                     "required": ["presentation_name", "header"],
                 },
@@ -377,13 +384,11 @@ async def main():
                             "type": "string",
                             "description": "Theme for the slide (e.g., modern_blue, elegant_green)",
                             "default": default_theme
-
                         }
                     },
                     "required": ["presentation_name", "title", "caption", "image_path"],
                 },
             ),
-
             types.Tool(
                 name="add-animation",
                 description="Add an animation effect to a specific slide in the presentation (Windows-only).",
@@ -447,43 +452,45 @@ async def main():
             ),
         ]
 
-
     @mcp.call_tool()
     async def handle_call_tool(
-            name: str, arguments: dict | None
+            name: str | None = None, arguments: dict | None = None
     ) -> list[types.TextContent | types.ImageContent | types.EmbeddedResource]:
         """Handle PowerPoint tool execution requests."""
-        if not arguments:
-            raise ValueError("Missing arguments")
+        if name is None:
+            logger.error("Tool name is missing in handle_call_tool")
+            raise ValueError("Tool name is missing")
+        if arguments is None:
+            logger.error(f"Arguments are missing for tool: {name}")
+            raise ValueError(f"Arguments are missing for tool: {name}")
+
+        logger.debug(f"Handling tool call: {name} with arguments: {arguments}")
         if name == "open-presentation":
             presentation_name = arguments.get("presentation_name")
             output_path = arguments.get("output_path")
             if not presentation_name:
                 raise ValueError("Missing presentation name")
-            file_name = f"{presentation_name}.pptx"
 
+            file_name = f"{presentation_name}.pptx"
             try:
-                safe_file_path = sanitize_path(folder_path, file_name)
+                safe_file_path = sanitize_path(args.folder_path, file_name)
             except ValueError as e:
                 raise ValueError(f"Invalid file path: {str(e)}")
 
-            # attempt to load presentation
+            # Attempt to load presentation
             try:
                 prs = Presentation(safe_file_path)
             except Exception as e:
                 raise ValueError(f"Unable to load {safe_file_path}. Error: {str(e)}")
 
             # Create a backup of the original file
-            file_name = BACKUP_FILE_NAME
+            backup_file_name = f"backup_{presentation_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pptx"
             try:
-                safe_file_path = sanitize_path(folder_path, file_name)
-            except ValueError as e:
-                raise ValueError(f"Invalid file path: {str(e)}")
-            # attempt to save a backup of presentation
-            try:
-                prs.save(safe_file_path)
+                safe_backup_path = sanitize_path(args.folder_path, backup_file_name)
+                prs.save(safe_backup_path)
+                logger.info(f"Created backup of presentation at {safe_backup_path}")
             except Exception as e:
-                raise ValueError(f"Unable to save {safe_file_path}. Error: {str(e)}")
+                raise ValueError(f"Unable to save backup at {safe_backup_path}. Error: {str(e)}")
 
             presentation_manager.presentations[presentation_name] = prs
 
@@ -496,28 +503,29 @@ async def main():
         elif name == "generate-and-save-image":
             prompt = arguments.get("prompt")
             file_name = arguments.get("file_name")
-            theme = arguments.get("theme", default_theme)
+            theme = validate_theme(arguments.get("theme", default_theme))
             try:
-                safe_file_path = sanitize_path(folder_path, file_name)
+                safe_file_path = sanitize_path(args.folder_path, file_name)
             except ValueError as e:
                 raise ValueError(f"Invalid file path: {str(e)}")
 
             if not all([prompt, file_name]):
                 raise ValueError("Missing required arguments")
-            print("hello line 499")
+            logger.debug("Generating image for prompt: %s", prompt)
 
             try:
                 # Append theme to prompt for consistent styling
                 themed_prompt = f"{prompt}, high quality, {theme} tones"
                 saved_path = await vision_manager.generate_and_save_image(themed_prompt, str(safe_file_path))
+                logger.info(f"Generated and saved image to: {saved_path}")
                 return [
                     types.TextContent(
                         type="text",
                         text=f"Successfully generated and saved image to: {saved_path}"
-
                     )
                 ]
             except Exception as e:
+                logger.error(f"Failed to generate image: {str(e)}")
                 return [
                     types.TextContent(
                         type="text",
@@ -525,14 +533,13 @@ async def main():
                     )
                 ]
         elif name == "add-slide-comparison":
-            # Get arguments
             presentation_name = arguments.get("presentation_name")
             title = arguments.get("title")
             left_side_title = arguments.get("left_side_title")
             left_side_content = arguments.get("left_side_content")
             right_side_title = arguments.get("right_side_title")
             right_side_content = arguments.get("right_side_content")
-            theme = arguments.get("theme", default_theme)
+            theme = validate_theme(arguments.get("theme", default_theme))
 
             if not all([presentation_name, title, left_side_title, left_side_content,
                         right_side_title, right_side_content]):
@@ -541,24 +548,24 @@ async def main():
             if presentation_name not in presentation_manager.presentations:
                 raise ValueError(f"Presentation not found: {presentation_name}")
             try:
-                slide = presentation_manager.add_comparison_slide(presentation_name, title, left_side_title,
-                                                                  left_side_content, right_side_title, right_side_content, theme = theme)
+                slide = presentation_manager.add_comparison_slide(
+                    presentation_name, title, left_side_title, left_side_content, right_side_title, right_side_content, theme=theme
+                )
+                logger.info(f"Added comparison slide '{title}' to {presentation_name}")
             except Exception as e:
-                raise ValueError(f"Unable to add comparison slide to {presentation_name}.pptx")
+                logger.error(f"Unable to add comparison slide to {presentation_name}. Error: {str(e)}")
+                raise ValueError(f"Unable to add comparison slide to {presentation_name}. Error: {str(e)}")
 
             return [types.TextContent(
                 type="text",
-                text=f"Successfully added comparison slide {title} to {presentation_name}.pptx"
+                text=f"Successfully added comparison slide '{title}' to {presentation_name}.pptx"
             )]
-
         elif name == "add-slide-picture-with-caption":
-
-            # Get arguments
             presentation_name = arguments.get("presentation_name")
             title = arguments.get("title")
             caption = arguments.get("caption")
             file_name = arguments.get("image_path")
-            theme = arguments.get("theme", default_theme)
+            theme = validate_theme(arguments.get("theme", default_theme))
 
             if not all([presentation_name, title, caption, file_name]):
                 raise ValueError("Missing required arguments")
@@ -567,34 +574,35 @@ async def main():
                 raise ValueError(f"Presentation not found: {presentation_name}")
 
             try:
-                safe_file_path = sanitize_path(folder_path, file_name)
+                safe_file_path = sanitize_path(args.folder_path, file_name)
             except ValueError as e:
                 raise ValueError(f"Invalid file path: {str(e)}")
 
             try:
-                slide = presentation_manager.add_picture_with_caption_slide(presentation_name, title, str(safe_file_path), caption,theme =theme)
+                slide = presentation_manager.add_picture_with_caption_slide(presentation_name, title, str(safe_file_path), caption, theme=theme)
+                logger.info(f"Added slide with caption and picture '{title}' to {presentation_name}")
             except Exception as e:
-                raise ValueError(f"Unable to add slide with caption and picture layout to {presentation_name}.pptx. Error: {str(e)}")
+                logger.error(f"Unable to add slide with caption and picture to {presentation_name}. Error: {str(e)}")
+                raise ValueError(f"Unable to add slide with caption and picture to {presentation_name}. Error: {str(e)}")
 
             return [types.TextContent(
                 type="text",
-                text=f"Successfully added slide with caption and picture layout to {presentation_name}.pptx"
+                text=f"Successfully added slide with caption and picture '{title}' to {presentation_name}.pptx"
             )]
-
         elif name == "create-presentation":
-
             presentation_name = arguments.get("name")
-            theme = arguments.get("theme", default_theme)
+            theme = validate_theme(arguments.get("theme", default_theme))
 
             if not presentation_name:
                 raise ValueError("Missing presentation name")
 
-            # Create new presentation
             try:
                 prs = presentation_manager.create_presentation(presentation_name, theme=theme)
                 presentation_manager.presentations[presentation_name] = prs
-            except KeyError as e:
-                raise ValueError(f"Unable to add {presentation_name} to presentation. Error: {str(e)}")
+                logger.info(f"Created new presentation: {presentation_name}")
+            except Exception as e:
+                logger.error(f"Unable to create presentation {presentation_name}. Error: {str(e)}")
+                raise ValueError(f"Unable to create presentation {presentation_name}. Error: {str(e)}")
 
             return [
                 types.TextContent(
@@ -602,11 +610,11 @@ async def main():
                     text=f"Created new presentation: {presentation_name}"
                 )
             ]
-
         elif name == "add-slide-title-content":
             presentation_name = arguments.get("presentation_name")
             title = arguments.get("title")
             content = arguments.get("content")
+            theme = validate_theme(arguments.get("theme", default_theme))
 
             if not all([presentation_name, title, content]):
                 raise ValueError("Missing required arguments")
@@ -614,10 +622,21 @@ async def main():
             if presentation_name not in presentation_manager.presentations:
                 raise ValueError(f"Presentation not found: {presentation_name}")
 
+            def validate_content(content: str) -> None:
+                main_points = content.split('\n')
+                if len(main_points) > 4:
+                    raise ValueError("Content exceeds maximum of 4 main points")
+                for point in main_points:
+                    if point.startswith('\t') and not point.strip():
+                        raise ValueError("Invalid sub-point format")
+
             try:
-                slide = presentation_manager.add_title_with_content_slide(presentation_name, title, content,theme=default_theme)
+                validate_content(content)
+                slide = presentation_manager.add_title_with_content_slide(presentation_name, title, content, theme=theme)
+                logger.info(f"Added slide '{title}' to {presentation_name}")
             except Exception as e:
-                raise ValueError(f"Unable to add slide '{title}' to presentation: {presentation_name}")
+                logger.error(f"Unable to add slide '{title}' to {presentation_name}. Error: {str(e)}")
+                raise ValueError(f"Unable to add slide '{title}' to {presentation_name}. Error: {str(e)}")
 
             return [
                 types.TextContent(
@@ -629,6 +648,7 @@ async def main():
             presentation_name = arguments.get("presentation_name")
             header = arguments.get("header")
             subtitle = arguments.get("subtitle")
+            theme = validate_theme(arguments.get("theme", default_theme))
 
             if not all([presentation_name, header]):
                 raise ValueError("Missing required arguments")
@@ -637,9 +657,11 @@ async def main():
                 raise ValueError(f"Presentation not found: {presentation_name}")
 
             try:
-                slide = presentation_manager.add_section_header_slide(presentation_name, header, subtitle, theme = default_theme)
+                slide = presentation_manager.add_section_header_slide(presentation_name, header, subtitle, theme=theme)
+                logger.info(f"Added section header slide '{header}' to {presentation_name}")
             except Exception as e:
-                raise ValueError(f"Unable to add slide '{header}' to presentation: {presentation_name}")
+                logger.error(f"Unable to add section header slide '{header}' to {presentation_name}. Error: {str(e)}")
+                raise ValueError(f"Unable to add section header slide '{header}' to {presentation_name}. Error: {str(e)}")
 
             return [
                 types.TextContent(
@@ -651,8 +673,7 @@ async def main():
             presentation_name = arguments.get("presentation_name")
             title = arguments.get("title")
             table_data = arguments.get("data")
-
-            theme = arguments.get("theme", default_theme)
+            theme = validate_theme(arguments.get("theme", default_theme))
 
             if not all([presentation_name, title, table_data]):
                 raise ValueError("Missing required arguments")
@@ -660,7 +681,6 @@ async def main():
             if presentation_name not in presentation_manager.presentations:
                 raise ValueError(f"Presentation not found: {presentation_name}")
 
-            # Validate table data structure
             headers = table_data.get("headers", [])
             rows = table_data.get("rows", [])
 
@@ -670,13 +690,14 @@ async def main():
             if not rows:
                 raise ValueError("Table rows are required")
 
-            # Validate that all rows match header length
             if not all(len(row) == len(headers) for row in rows):
                 raise ValueError("All rows must have the same number of columns as headers")
             try:
-                slide = presentation_manager.add_table_slide(presentation_name, title, headers, rows,theme=theme)
+                slide = presentation_manager.add_table_slide(presentation_name, title, headers, rows, theme=theme)
+                logger.info(f"Added table slide '{title}' to {presentation_name}")
             except Exception as e:
-                raise ValueError(f"Unable to add slide '{title}' with a table to presentation: {presentation_name}")
+                logger.error(f"Unable to add table slide '{title}' to {presentation_name}. Error: {str(e)}")
+                raise ValueError(f"Unable to add table slide '{title}' to {presentation_name}. Error: {str(e)}")
 
             return [
                 types.TextContent(
@@ -688,7 +709,7 @@ async def main():
             presentation_name = arguments.get("presentation_name")
             title = arguments.get("title")
             chart_data = arguments.get("data")
-            theme = arguments.get("theme", default_theme)
+            theme = validate_theme(arguments.get("theme", default_theme))
 
             if not all([presentation_name, title, chart_data]):
                 raise ValueError("Missing required arguments")
@@ -696,26 +717,23 @@ async def main():
             if presentation_name not in presentation_manager.presentations:
                 raise ValueError(f"Presentation not found: {presentation_name}")
 
-            # Get the presentation and create a new slide
             prs = presentation_manager.presentations[presentation_name]
             slide_layout = prs.slide_layouts[5]  # Title and blank content
             slide = prs.slides.add_slide(slide_layout)
 
-            # Set the title
             title_shape = slide.shapes.title
             title_shape.text = title
 
-            # Determine the best chart type for the data
             try:
                 chart_type, chart_format = chart_manager.determine_chart_type(chart_data)
             except Exception as e:
-                raise ValueError(f"Unable to determine chart type.")
+                logger.error(f"Unable to determine chart type: {str(e)}")
+                raise ValueError(f"Unable to determine chart type: {str(e)}")
 
-            # Add the chart to the slide
             try:
-                chart = chart_manager.add_chart_to_slide(slide, chart_type, chart_data, chart_format,theme=theme)
+                chart = chart_manager.add_chart_to_slide(slide, chart_type, chart_data, chart_format, theme=theme)
                 chart_type_name = chart_type.name.lower().replace('xl_chart_type.', '')
-
+                logger.info(f"Added {chart_type_name} chart slide '{title}' to {presentation_name}")
                 return [
                     types.TextContent(
                         type="text",
@@ -723,10 +741,12 @@ async def main():
                     )
                 ]
             except Exception as e:
-                raise ValueError(f"Failed to create slide with chart: {str(e)}")
+                logger.error(f"Failed to create chart slide: {str(e)}")
+                raise ValueError(f"Failed to create chart slide: {str(e)}")
         elif name == "add-slide-title-only":
             presentation_name = arguments.get("presentation_name")
             title = arguments.get("title")
+            theme = validate_theme(arguments.get("theme", default_theme))
 
             if not all([presentation_name, title]):
                 raise ValueError("Missing required arguments")
@@ -735,9 +755,11 @@ async def main():
                 raise ValueError(f"Presentation not found: {presentation_name}")
 
             try:
-                slide = presentation_manager.add_title_slide(presentation_name, title,theme=default_theme)
+                slide = presentation_manager.add_title_slide(presentation_name, title, theme=theme)
+                logger.info(f"Added title slide '{title}' to {presentation_name}")
             except Exception as e:
-                 raise ValueError(f"Unable to add '{title} to presentation: {presentation_name}. Error: {e}")
+                logger.error(f"Unable to add title slide '{title}' to {presentation_name}. Error: {str(e)}")
+                raise ValueError(f"Unable to add title slide '{title}' to {presentation_name}. Error: {str(e)}")
 
             return [
                 types.TextContent(
@@ -756,8 +778,13 @@ async def main():
             if presentation_name not in presentation_manager.presentations:
                 raise ValueError(f"Presentation not found: {presentation_name}")
 
+            prs = presentation_manager.presentations[presentation_name]
+            if slide_index < 0 or slide_index >= len(prs.slides):
+                raise ValueError(f"Invalid slide index: {slide_index}")
+
             try:
                 result = presentation_manager.add_animation(presentation_name, slide_index, effect)
+                logger.info(f"Added animation '{effect}' to slide {slide_index} in {presentation_name}")
                 return [
                     types.TextContent(
                         type="text",
@@ -765,11 +792,11 @@ async def main():
                     )
                 ]
             except Exception as e:
+                logger.error(f"Unable to add animation to slide {slide_index} in {presentation_name}. Error: {str(e)}")
                 raise ValueError(f"Unable to add animation to slide {slide_index} in {presentation_name}. Error: {str(e)}")
         elif name == "save-presentation":
             presentation_name = arguments.get("presentation_name")
             output_path = arguments.get("output_path")
-
 
             if not presentation_name:
                 raise ValueError("Missing presentation name")
@@ -779,16 +806,25 @@ async def main():
 
             prs = presentation_manager.presentations[presentation_name]
 
-            # Default output path if none provided
             if not output_path:
                 output_path = f"{presentation_name}.pptx"
 
-            file_path = os.path.join(path,output_path)
-            # Save the presentation
             try:
+                file_path = sanitize_path(args.folder_path, output_path)
+            except ValueError as e:
+                raise ValueError(f"Invalid file path: {str(e)}")
+
+            try:
+                if os.path.exists(file_path):
+                    backup_file_name = f"backup_{presentation_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pptx"
+                    backup_path = sanitize_path(args.folder_path, backup_file_name)
+                    prs.save(backup_path)
+                    logger.info(f"Created backup of existing file at {backup_path}")
                 prs.save(file_path)
+                logger.info(f"Saved presentation to: {file_path}")
             except Exception as e:
-                raise ValueError(f"Unable to save the {presentation_name}. Error: {e}")
+                logger.error(f"Unable to save presentation {presentation_name}. Error: {str(e)}")
+                raise ValueError(f"Unable to save presentation {presentation_name}. Error: {str(e)}")
 
             return [
                 types.TextContent(
@@ -796,25 +832,34 @@ async def main():
                     text=f"Saved presentation to: {file_path}"
                 )
             ]
-
         else:
+            logger.error(f"Unknown tool: {name}")
             raise ValueError(f"Unknown tool: {name}")
 
-    async with mcp.server.stdio.stdio_server() as (read_stream, write_stream):
-        logger.info("Server running with stdio transport")
-        await mcp.run(
-            read_stream,
-            write_stream,
-            InitializationOptions(
-                server_name="PPTServer",
-                server_version="0.1.0",
-                capabilities=mcp.get_capabilities(
-                    notification_options=NotificationOptions(),
-                    experimental_capabilities={},
-                ),
-            ),
-        )
-
+    try:
+        async with mcp.server.stdio.stdio_server() as (read_stream, write_stream):
+            logger.info(f"Server running with stdio transport: read_stream={read_stream}, write_stream={write_stream}")
+            try:
+                await mcp.run(
+                    read_stream,
+                    write_stream,
+                    InitializationOptions(
+                        server_name="powerpoint-server",
+                        server_version="0.1.0",
+                        capabilities=mcp.get_capabilities(
+                            notification_options=NotificationOptions(),
+                            experimental_capabilities={},
+                        ),
+                    ),
+                )
+            except Exception as e:
+                logger.error(f"Error running MCP server: {str(e)}")
+                raise
+            finally:
+                logger.info("Cleaning up server resources")
+    except AttributeError as e:
+        logger.error(f"Failed to initialize stdio server: {str(e)}. Ensure FastMCP supports the stdio_server context manager.")
+        raise
 
 if __name__ == "__main__":
     asyncio.run(main())
